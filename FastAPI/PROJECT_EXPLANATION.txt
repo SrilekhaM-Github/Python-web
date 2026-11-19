@@ -1,0 +1,188 @@
+=====================================================================
+EXPENSE TRACKER API - PROJECT EXPLANATION
+=====================================================================
+
+1. OVERVIEW
+---------------------------------------------------------------------
+This is a small REST API built with Python using:
+  - FastAPI     : web framework that defines the API endpoints
+  - SQLAlchemy  : ORM that talks to the database using Python classes
+  - Pydantic    : validates incoming data and shapes outgoing data
+  - SQLite      : file-based database (expenses.db)
+
+What it does: lets a client ADD an expense (title, amount, category)
+and LIST all saved expenses.
+
+Run it with (from the project folder, inside the virtual env):
+    uvicorn main:app --reload
+Then open http://127.0.0.1:8000/docs for interactive Swagger UI.
+
+
+2. PROJECT FILES
+---------------------------------------------------------------------
+  main.py      - creates the app, defines the endpoints and DB dependency
+  database.py  - database connection setup (engine, session, Base)
+  models.py    - database table definition (Expense)
+  schemas.py   - request/response data shapes (ExpenseCreate, ExpenseOut)
+  expenses.db  - the SQLite database file (auto-created)
+  env/         - Python virtual environment (installed libraries)
+  __pycache__/ - compiled Python cache (auto-generated, ignore)
+
+Request flow:
+  Client JSON -> schemas.ExpenseCreate (validation) -> main.py endpoint
+  -> models.Expense (DB row) -> SQLite -> schemas.ExpenseOut -> JSON back
+
+
+3. database.py  (database connection setup)
+---------------------------------------------------------------------
+This file has no functions; it defines 4 objects used everywhere else.
+
+  DATABASE_URL = "sqlite:///./expenses.db"
+      Connection string. Uses SQLite and stores data in the file
+      expenses.db in the current folder.
+
+  engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+      create_engine(): creates the core connection to the database.
+      check_same_thread=False: SQLite normally only allows the thread
+      that created a connection to use it. FastAPI may handle requests
+      on different threads, so this check is turned off.
+
+  SessionLocal = sessionmaker(bind=engine, autoflush=False)
+      sessionmaker(): a factory that produces database sessions.
+      A session is a "conversation" with the DB (query, add, commit).
+      bind=engine  -> sessions use the engine above.
+      autoflush=False -> pending changes are NOT automatically sent to
+      the DB before each query; they are sent on commit().
+
+  Base = declarative_base()
+      declarative_base(): creates the parent class all table models
+      inherit from. SQLAlchemy uses it to track every table.
+
+
+4. models.py  (database table)
+---------------------------------------------------------------------
+  class Expense(Base)
+      Python class that maps to the "expenses" table. Each instance
+      represents one row.
+
+      __tablename__ = "expenses"   -> name of the table in SQLite.
+
+      Columns:
+        id       Integer, primary_key=True, index=True
+                 Unique row number, auto-incremented by the DB.
+                 index=True makes lookups by id faster.
+        title    String   - what the expense was (e.g. "Lunch").
+        amount   Float    - cost of the expense (e.g. 12.5).
+        category String   - group label (e.g. "Food", "Travel").
+
+
+5. schemas.py  (data validation / serialization)
+---------------------------------------------------------------------
+Schemas describe what JSON the API accepts and returns. They are
+separate from models: models = DB shape, schemas = API shape.
+
+  class ExpenseCreate(BaseModel)
+      Shape of the data a client SENDS when creating an expense.
+        title: str, amount: float, category: str
+      If a field is missing or the wrong type (e.g. amount="abc"),
+      FastAPI automatically rejects the request with a 422 error.
+
+  class ExpenseOut(ExpenseCreate)
+      Shape of the data the API RETURNS. Inherits the three fields
+      above and adds:  id: int
+      model_config = ConfigDict(from_attributes=True)
+          Lets Pydantic read data directly from a SQLAlchemy object
+          (attributes like expense.title) rather than only from a dict.
+          Without this, returning a models.Expense would fail.
+
+
+6. main.py  (application and endpoints)
+---------------------------------------------------------------------
+Imports: FastAPI and Depends (framework + dependency injection),
+Session (type hint for DB session), and the pieces from the other
+files.
+
+  Base.metadata.create_all(bind=engine)
+      Runs once at startup. Looks at every model that inherits from
+      Base (here, Expense) and creates its table in expenses.db if it
+      does not already exist. It does not modify existing tables.
+
+  app = FastAPI()
+      Creates the web application. Endpoints are attached to it.
+
+  ---- FUNCTION: get_db() ----
+  def get_db():
+      db = SessionLocal()      # open a new DB session
+      try:
+          yield db             # hand the session to the endpoint
+      finally:
+          db.close()           # always close it, even if an error occurs
+  Purpose: a "dependency" that gives each request its own DB session
+  and guarantees cleanup afterward. It is a generator: code before
+  yield runs before the endpoint, code in finally runs after the
+  response. Prevents leaked connections.
+
+  ---- FUNCTION: add_expense(expense, db) ----
+  @app.post("/expenses", response_model=schemas.ExpenseOut)
+  def add_expense(expense: schemas.ExpenseCreate, db: Session = Depends(get_db)):
+  Endpoint: POST /expenses   (create a new expense)
+  Parameters:
+    expense - the request JSON body, already validated against
+              ExpenseCreate.
+    db      - a DB session injected by Depends(get_db).
+  Steps:
+    1. expense.model_dump()
+         converts the validated Pydantic object to a dict
+         {"title":..., "amount":..., "category":...}.
+    2. models.Expense(**dict)
+         builds a new Expense DB object from that dict (** unpacks
+         the dict into keyword arguments).
+    3. db.add(new_expense)
+         stages the object for insertion (not saved yet).
+    4. db.commit()
+         writes the row permanently to the database.
+    5. db.refresh(new_expense)
+         reloads the object from the DB so it now contains the
+         auto-generated id.
+    6. return new_expense
+         response_model=ExpenseOut filters/serializes it to JSON
+         containing id, title, amount, category.
+  Example request body:
+      {"title": "Lunch", "amount": 12.5, "category": "Food"}
+  Example response:
+      {"title": "Lunch", "amount": 12.5, "category": "Food", "id": 1}
+
+  ---- FUNCTION: list_expenses(db) ----
+  @app.get("/expenses", response_model=list[schemas.ExpenseOut])
+  def list_expenses(db: Session = Depends(get_db)):
+  Endpoint: GET /expenses   (read all expenses)
+  Parameter:
+    db - DB session injected by Depends(get_db).
+  Steps:
+    1. db.query(models.Expense)  -> start a query on the expenses table.
+    2. .all()                    -> run it and return every row as a list.
+    3. response_model=list[ExpenseOut] converts each row to JSON.
+  Returns an empty list [] if nothing has been added yet.
+  Note: there is no filtering, sorting, or pagination.
+
+
+7. SUMMARY OF ALL FUNCTIONS / CLASSES
+---------------------------------------------------------------------
+  database.py : create_engine(), sessionmaker(), declarative_base()
+                (library calls that build engine, SessionLocal, Base)
+  models.py   : class Expense            -> "expenses" table
+  schemas.py  : class ExpenseCreate      -> input validation
+                class ExpenseOut         -> output format (adds id)
+  main.py     : get_db()                 -> per-request DB session
+                add_expense()            -> POST /expenses
+                list_expenses()          -> GET  /expenses
+
+
+8. POSSIBLE IMPROVEMENTS
+---------------------------------------------------------------------
+  - Add endpoints to get one expense, update, and delete (full CRUD).
+  - Add filtering by category and a total-spent summary endpoint.
+  - Add a date field to Expense.
+  - Add validation such as amount > 0 (Field(gt=0) in the schema).
+  - Add a requirements.txt listing fastapi, uvicorn, sqlalchemy.
+=====================================================================
